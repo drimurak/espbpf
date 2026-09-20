@@ -1,0 +1,58 @@
+name: ci
+
+# Three things are worth automating here, and they are exactly the three
+# that caught real bugs during development:
+#   - the test suite, built with ASan/UBSan;
+#   - the fuzzers, because the verifier's job is to survive hostile input;
+#   - a build of the firmware for both targets, because the VM has to
+#     compile for Xtensa, not just for x86 (that is how the "int32_t is
+#     long on Xtensa" bug was found).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: tests (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install clang (needed for -target bpf)
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: clang can emit eBPF
+        run: clang -print-targets | grep -q bpf
+      - name: build and run the test suite
+        run: make          # unit tests + examples + must-be-rejected programs
+
+  fuzz:
+    name: fuzz the loader and the verifier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - name: build the fuzzers and the seed corpus
+        run: make fuzz
+      # Seeds are the real example objects, so mutants stay close to
+      # plausible programs instead of being rejected at the ELF header.
+      - name: ELF loader, 3M mutated objects
+        run: ./build/fuzz_elf 3000000 build/examples/*.o
+      - name: verifier, 5M mutated programs
+        run: ./build/fuzz_verify 5000000 build/corpus_v/*
+
+  firmware:
+    name: firmware (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32, esp32s3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.3.1
+          target: ${{ matrix.target }}
+          path: firmware

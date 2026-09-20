@@ -144,6 +144,24 @@ int main(int argc, char **argv)
     attr.log_buf = (uint64_t)(unsigned long)verifier_log;
 
     int fd = (int)syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+    /* No verdict at all: the kernel refused to look. Saying "REJECT" here
+     * would invent a result the verifier never produced. */
+    if (fd < 0 && errno == EPERM) {
+        char sysctl[8] = "?";
+        FILE *f = fopen("/proc/sys/kernel/unprivileged_bpf_disabled", "r");
+        if (f) {
+            if (!fgets(sysctl, sizeof(sysctl), f))
+                sysctl[0] = '?';
+            fclose(f);
+        }
+        sysctl[strcspn(sysctl, "\n")] = '\0';
+        fprintf(stderr,
+                "kverify: bpf(BPF_PROG_LOAD) denied (EPERM), no verdict to report.\n"
+                "  Loading a BPF program needs CAP_BPF, and unprivileged BPF is\n"
+                "  disabled here (kernel.unprivileged_bpf_disabled=%s).\n"
+                "  Run this under sudo.\n", sysctl);
+        return 3;
+    }
     if (verbose)
         fputs(verifier_log, stdout);
     if (fd >= 0) {
