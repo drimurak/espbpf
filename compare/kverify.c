@@ -27,7 +27,15 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-static char verifier_log[256 * 1024];
+/* The verifier log grows with the program: log_level=1 prints a line per
+ * instruction. If it does not fit, bpf() fails with ENOSPC and the program
+ * is not loaded — a failure caused by the tool, not by the program. So the
+ * buffer grows and the load is retried, the way libbpf does it. */
+#define LOG_START (256u * 1024)
+#define LOG_MAX   (64u * 1024 * 1024)
+
+static char *verifier_log;
+static size_t verifier_log_size;
 
 static void *read_file(const char *path, size_t *len)
 {
@@ -134,16 +142,27 @@ int main(int argc, char **argv)
     }
 
     union bpf_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
-    attr.insn_cnt = (uint32_t)(code_len / 8);
-    attr.insns = (uint64_t)(unsigned long)code;
-    attr.license = (uint64_t)(unsigned long)"GPL";
-    attr.log_level = 1;
-    attr.log_size = sizeof(verifier_log);
-    attr.log_buf = (uint64_t)(unsigned long)verifier_log;
+    int fd;
+    for (verifier_log_size = LOG_START;; verifier_log_size *= 8) {
+        free(verifier_log);
+        verifier_log = calloc(1, verifier_log_size);
+        if (!verifier_log) {
+            fprintf(stderr, "kverify: out of memory for the verifier log\n");
+            return 2;
+        }
+        memset(&attr, 0, sizeof(attr));
+        attr.prog_type = BPF_PROG_TYPE_SOCKET_FILTER;
+        attr.insn_cnt = (uint32_t)(code_len / 8);
+        attr.insns = (uint64_t)(unsigned long)code;
+        attr.license = (uint64_t)(unsigned long)"GPL";
+        attr.log_level = 1;
+        attr.log_size = (uint32_t)verifier_log_size;
+        attr.log_buf = (uint64_t)(unsigned long)verifier_log;
 
-    int fd = (int)syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+        fd = (int)syscall(SYS_bpf, BPF_PROG_LOAD, &attr, sizeof(attr));
+        if (fd >= 0 || errno != ENOSPC || verifier_log_size * 8 > LOG_MAX)
+            break;
+    }
     /* No verdict at all: the kernel refused to look. Saying "REJECT" here
      * would invent a result the verifier never produced. */
     if (fd < 0 && errno == EPERM) {
