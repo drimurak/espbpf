@@ -266,6 +266,40 @@ int main(void)
         expect_reject("uninit r0", c, N(c), &env, "r0 is not initialised");
     }
     {
+        struct espbpf_insn c[] = { LDX(BPF_B, 0, 10, -1), EXIT() };
+        expect_reject("uninit stack byte", c, N(c), &env, "uninitialised byte");
+    }
+    {
+        /* Initialising one byte does not make the rest of a wider load safe. */
+        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -8, 1),
+                                   LDX(BPF_DW, 0, 10, -8), EXIT() };
+        expect_reject("partially initialised stack load", c, N(c), &env,
+                      "uninitialised byte");
+    }
+    {
+        /* The store occurs on only one incoming path to the load. */
+        struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 1),
+                                   ST_IMM(BPF_B, 10, -1, 9),
+                                   LDX(BPF_B, 0, 10, -1), EXIT() };
+        expect_reject("stack init merged across paths", c, N(c), &env,
+                      "uninitialised byte");
+    }
+    {
+        /* A byte written on both incoming paths remains initialised at join. */
+        struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 2),
+                                   ST_IMM(BPF_B, 10, -1, 1), JA(1),
+                                   ST_IMM(BPF_B, 10, -1, 2),
+                                   LDX(BPF_B, 0, 10, -1), EXIT() };
+        expect_ret("stack init on both paths", c, N(c), 1);
+    }
+    {
+        /* A helper with a pointer+length contract also reads stack memory. */
+        struct espbpf_insn c[] = { MOV64_REG(1, 10), ALU64_IMM(BPF_ADD, 1, -8),
+                                   MOV64_IMM(2, 1), CALL(2), EXIT() };
+        expect_reject("helper reads uninitialised stack", c, N(c), &env,
+                      "uninitialised stack byte");
+    }
+    {
         struct espbpf_insn c[] = { LDX(BPF_W, 2, 1, 0), JMP_IMM(BPF_JEQ, 2, 0, 1),
                                    MOV64_IMM(0, 1), EXIT() };
         expect_reject("uninit on one path", c, N(c), &env, "every path");
@@ -299,7 +333,8 @@ int main(void)
         expect_reject("scalar deref", c, N(c), &env, "scalar");
     }
     {
-        struct espbpf_insn c[] = { LDX(BPF_DW, 2, 10, -8), LDX(BPF_W, 0, 2, 0), EXIT() };
+        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
+                                   LDX(BPF_DW, 2, 10, -8), LDX(BPF_W, 0, 2, 0), EXIT() };
         expect_reject("pointer from memory", c, N(c), &env, "scalar");
     }
     {
@@ -370,7 +405,8 @@ int main(void)
 
     {
         /* i = ctx->a & 7; *(fp - 8 + i) : provable, no run-time check */
-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_AND, 3, 7),
+        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
+                                   LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_AND, 3, 7),
                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
                                    ALU64_REG(BPF_ADD, 2, 3), ST_IMM(BPF_B, 2, 0, 5),
                                    LDX(BPF_B, 0, 10, -1), EXIT() };
@@ -385,7 +421,8 @@ int main(void)
     }
     {
         /* if (i <= 7) { *(fp - 8 + i) } : the compare bounds i */
-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), MOV64_IMM(0, 0),
+        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
+                                   LDX(BPF_B, 3, 1, 0), MOV64_IMM(0, 0),
                                    JMP_IMM(BPF_JGT, 3, 7, 4),
                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
                                    ALU64_REG(BPF_ADD, 2, 3), LDX(BPF_B, 0, 2, 0),
@@ -401,7 +438,8 @@ int main(void)
     }
     {
         /* n % 8 is 0..7 */
-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MOD, 3, 8),
+        struct espbpf_insn c[] = { ST_IMM(BPF_DW, 10, -8, 0),
+                                   LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MOD, 3, 8),
                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
                                    ALU64_REG(BPF_ADD, 2, 3), ST_IMM(BPF_B, 2, 0, 9),
                                    LDX(BPF_B, 0, 10, -1), EXIT() };
@@ -410,7 +448,8 @@ int main(void)
     /* ---------------- run-time bounds (unknown offsets) ---------------- */
     {
         /* clang idiom: ptr |= small scalar (see comfort_leds.c) */
-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 4), ALU64_IMM(BPF_AND, 3, 3),
+        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -7, 0),
+                                   LDX(BPF_W, 3, 1, 4), ALU64_IMM(BPF_AND, 3, 3),
                                    MOV64_REG(2, 10), ALU64_IMM(BPF_ADD, 2, -8),
                                    ALU64_REG(BPF_OR, 2, 3), ST_IMM(BPF_B, 2, 0, 77),
                                    LDX(BPF_B, 0, 10, -7), EXIT() };
@@ -424,11 +463,12 @@ int main(void)
         expect_reject("ptr |= address", c, N(c), &env, "out of bounds");
     }
     {
-        /* r2 = fp + ctx->a*100 (unknown offset); load -> must fault, not read */
+        /* An unknown stack offset cannot be proven initialised, so reject it
+         * before execution rather than relying on a run-time bounds fault. */
         struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MUL, 3, 100),
                                    MOV64_REG(2, 10), ALU64_REG(BPF_ADD, 2, 3),
                                    LDX(BPF_DW, 0, 2, 0), EXIT() };
-        expect_fault("runtime oob above stack", c, N(c));
+        expect_reject("unknown stack load", c, N(c), &env, "unknown offset");
     }
     {
         struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), ALU64_IMM(BPF_MUL, 3, 1000),
@@ -438,7 +478,8 @@ int main(void)
     }
     {
         /* same pattern, in bounds: fp - ctx->a (7) */
-        struct espbpf_insn c[] = { LDX(BPF_W, 3, 1, 0), MOV64_REG(2, 10),
+        struct espbpf_insn c[] = { ST_IMM(BPF_B, 10, -7, 1),
+                                   LDX(BPF_W, 3, 1, 0), MOV64_REG(2, 10),
                                    ALU64_REG(BPF_SUB, 2, 3), ST_IMM(BPF_B, 2, 0, 9),
                                    LDX(BPF_B, 0, 10, -7), EXIT() };
         expect_ret("runtime in-bounds index", c, N(c), 9);

@@ -8,7 +8,7 @@
  * portable interpreter. The verifier guarantees that an accepted program:
  *   - terminates (the control-flow graph is acyclic, so the number of
  *     executed instructions is bounded by the program length);
- *   - never reads an uninitialised register;
+ *   - never reads an uninitialised register or stack byte;
  *   - dereferences only pointers it was given (context, stack, rodata),
  *     never scalars;
  *   - calls only helpers registered by the host, with correctly typed

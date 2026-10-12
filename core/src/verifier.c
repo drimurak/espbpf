@@ -19,7 +19,9 @@
  * interpreter's run-time bounds checks. Dereferencing a scalar is always
  * rejected.
  *
- * Memory cost: 44 bytes per jump target plus 2 bytes per instruction.
+ * Memory cost: sizeof(struct vstate) per jump target plus 2 bytes per
+ * instruction. A state also carries a byte-level bitmap of initialised
+ * stack memory so reads are safe across control-flow joins.
  */
 #include <stdarg.h>
 #include <stdio.h>
@@ -85,6 +87,8 @@ static const struct reg R_ANY = { T_SCALAR, 0, RLO, RHI };
 
 struct vstate {
     struct reg r[11];
+    /* One bit per byte of the 512-byte eBPF stack. */
+    uint8_t stack_init[ESPBPF_STACK_SIZE / 8];
 };
 
 #define NO_SLOT 0xffff
@@ -372,6 +376,9 @@ static void merge(struct vstate *into, const struct vstate *from)
             *a = (struct reg){ T_MIXED, 0, 0, 0 };
         }
     }
+    /* A byte is initialised after a join only if every incoming path wrote it. */
+    for (size_t i = 0; i < sizeof(into->stack_init); i++)
+        into->stack_init[i] &= from->stack_init[i];
 }
 
 static void propagate(struct verifier *v, uint32_t target,
@@ -454,6 +461,27 @@ static void refine(struct reg *r, uint8_t op, int64_t imm, bool taken)
     r->hi = (int32_t)clamp64(hi);
 }
 
+static bool stack_range_initialized(const struct vstate *st,
+                                    int64_t lo, int64_t hi)
+{
+    if (lo < -(int64_t)ESPBPF_STACK_SIZE || hi > 0 || lo > hi)
+        return false;
+    for (int64_t off = lo; off < hi; off++) {
+        size_t byte = (size_t)(off + ESPBPF_STACK_SIZE);
+        if (!(st->stack_init[byte / 8] & (uint8_t)(1u << (byte % 8))))
+            return false;
+    }
+    return true;
+}
+
+static void stack_mark_initialized(struct vstate *st, int64_t lo, int64_t hi)
+{
+    for (int64_t off = lo; off < hi; off++) {
+        size_t byte = (size_t)(off + ESPBPF_STACK_SIZE);
+        st->stack_init[byte / 8] |= (uint8_t)(1u << (byte % 8));
+    }
+}
+
 static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st,
                         unsigned base, int16_t off, unsigned size, bool write)
 {
@@ -487,6 +515,13 @@ static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st
                     base);
     }
     if (r_unknown(r)) {
+        /* An unknown stack offset may point at any byte. Do not let a
+         * dynamically bounds-checked load expose bytes not initialised on
+         * every path. */
+        if (r->type == T_PTR_STACK && !write &&
+            !stack_range_initialized(st, -(int64_t)ESPBPF_STACK_SIZE, 0))
+            return fail(v, pc,
+                        "stack read has an unknown offset and may include uninitialised bytes");
         /* No bound could be derived (e.g. `ptr |= scalar`). The access is
          * still safe: the interpreter range-checks every load and store. */
         v->dynamic_checks++;
@@ -503,8 +538,23 @@ static int check_access(struct verifier *v, uint32_t pc, const struct vstate *st
                     rtype_name[r->type], (long long)olo, (long long)ohi, size,
                     (long long)lo, (long long)hi);
     }
+    if (r->type == T_PTR_STACK && !write &&
+        !stack_range_initialized(st, olo, ohi + (int64_t)size))
+        return fail(v, pc, "stack read includes an uninitialised byte");
     v->static_checks++;     /* proven in the verifier, no run-time check needed */
     return ESPBPF_OK;
+}
+
+static void mark_stack_store(struct vstate *st, unsigned base, int16_t off,
+                             unsigned size)
+{
+    const struct reg *r = &st->r[base];
+    /* A variable-offset store writes only one of its possible locations, so
+     * marking the whole abstract range would be unsound. */
+    if (r->type == T_PTR_STACK && !r_unknown(r) && r->lo == r->hi) {
+        int64_t lo = (int64_t)r->lo + off;
+        stack_mark_initialized(st, lo, lo + size);
+    }
 }
 
 /* Range transfer function for arithmetic on scalars. Returns the new
@@ -689,6 +739,54 @@ static int step_call(struct verifier *v, uint32_t pc, struct vstate *st,
             break;
         }
     }
+    for (unsigned i = 0; i < 5; i++) {
+        if (h->args[i] != ESPBPF_ARG_PTR_MEM)
+            continue;
+        if (i + 1 >= 5 || h->args[i + 1] != ESPBPF_ARG_SIZE)
+            return fail(v, pc, "%s: pointer argument has no size contract", h->name);
+        unsigned ptr_reg = i + 1;
+        unsigned size_reg = i + 2;
+        const struct reg *ptr = &st->r[ptr_reg];
+        const struct reg *len = &st->r[size_reg];
+        if (ptr->type != T_PTR_STACK)
+            continue;
+
+        /* Negative sizes become huge unsigned lengths and are rejected by
+         * the helper's bounds check. A zero length reads no stack bytes. */
+        if (!r_unknown(len) && len->hi <= 0)
+            continue;
+
+        int64_t lo, hi;
+        if (r_unknown(ptr) || r_unknown(len)) {
+            lo = -(int64_t)ESPBPF_STACK_SIZE;
+            hi = 0;
+        } else {
+            int64_t ptr_lo = ptr->lo;
+            int64_t ptr_hi = ptr->hi;
+            int64_t min_len = len->lo > 0 ? len->lo : 0;
+            int64_t max_len = len->hi;
+            if (ptr_lo < -(int64_t)ESPBPF_STACK_SIZE)
+                ptr_lo = -(int64_t)ESPBPF_STACK_SIZE;
+            if (ptr_hi > 0)
+                ptr_hi = 0;
+            /* The helper rejects an out-of-bounds (pointer, length) pair
+             * before reading. If even the smallest non-negative length
+             * cannot fit, this call cannot read any stack bytes. */
+            if (ptr_lo > ptr_hi || ptr_lo + min_len > 0)
+                continue;
+            lo = ptr_lo;
+            hi = ptr_hi + max_len;
+            if (lo < -(int64_t)ESPBPF_STACK_SIZE)
+                lo = -(int64_t)ESPBPF_STACK_SIZE;
+            if (hi > 0)
+                hi = 0;
+            if (hi < -(int64_t)ESPBPF_STACK_SIZE || lo >= hi)
+                continue;   /* no in-bounds stack byte can be read */
+        }
+        if (!stack_range_initialized(st, lo, hi))
+            return fail(v, pc,
+                        "%s: helper may read an uninitialised stack byte", h->name);
+    }
     for (unsigned r = 1; r <= 5; r++)
         st->r[r] = (struct reg){ T_UNINIT, 0, 0, 0 };
     st->r[0] = R_ANY;
@@ -755,12 +853,18 @@ static int pass2(struct verifier *v)
         case BPF_ST:
             rc = check_access(v, pc, &st, in->dst, in->off,
                               bpf_size_bytes(in->code), true);
+            if (!rc)
+                mark_stack_store(&st, in->dst, in->off,
+                                 bpf_size_bytes(in->code));
             break;
 
         case BPF_STX:
             if (!(rc = need_value(v, pc, &st, in->src)))
                 rc = check_access(v, pc, &st, in->dst, in->off,
                                   bpf_size_bytes(in->code), true);
+            if (!rc)
+                mark_stack_store(&st, in->dst, in->off,
+                                 bpf_size_bytes(in->code));
             break;
 
         default: /* JMP, JMP32 */
